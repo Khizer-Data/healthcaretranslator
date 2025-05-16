@@ -3,6 +3,7 @@
  */
 
 import { fallbackTranslate } from "./fallbackTranslation"
+import { translateWithTogetherAI } from "./togetherAIService"
 
 export type TranslationResult = {
   translation: string
@@ -40,13 +41,20 @@ export async function translateWithGroq(
 
     if (!response.ok) {
       let errorMessage = "Translation request failed"
+      const statusCode = response.status
 
       try {
         const errorData = await response.json()
         errorMessage = errorData.error || `Error: ${response.status}`
+        console.error("Translation error details:", errorData)
       } catch (e) {
         // If we can't parse the error response, use a generic message
         errorMessage = `Translation failed with status ${response.status}`
+      }
+
+      // If we get a 503 error, throw a specific error to trigger Together AI fallback
+      if (statusCode === 503) {
+        throw new Error("GROQ_SERVICE_UNAVAILABLE")
       }
 
       throw new Error(errorMessage)
@@ -54,9 +62,14 @@ export async function translateWithGroq(
 
     const result = await response.json()
 
+    // Check if we have a valid translation
+    if (!result.translation && !result.translatedText) {
+      throw new Error("No translation returned from API")
+    }
+
     return {
       speaker: result.speaker || "unknown",
-      translation: result.translation || "",
+      translation: result.translation || result.translatedText || "",
     }
   } catch (error) {
     console.error("Translation error:", error)
@@ -152,6 +165,19 @@ export async function translateText(
     return await translateWithGroq(text, inputLang, outputLang, model)
   } catch (error) {
     console.error("Groq translation failed:", error)
+
+    // Check if it's a 503 error or service unavailable error
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    if (errorMessage.includes("503") || errorMessage.includes("GROQ_SERVICE_UNAVAILABLE")) {
+      console.log("Groq service unavailable, falling back to Together AI")
+      try {
+        // Fall back to Together AI
+        return await translateWithTogetherAI(text, inputLang, outputLang)
+      } catch (togetherError) {
+        console.error("Together AI translation failed:", togetherError)
+        // Continue to next fallback
+      }
+    }
 
     // Use public API translation as fallback
     try {

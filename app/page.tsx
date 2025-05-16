@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect, useRef } from "react"
+import { useState, useEffect, useRef, useCallback } from "react"
 import { useTTS } from "../src/hooks/useTTS"
 import AudioVisualizer from "../components/AudioVisualizer"
 import TranscriptPane from "../components/TranscriptPane"
@@ -8,10 +8,13 @@ import Banner from "../components/Banner"
 import { Button } from "../components/ui/button"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select"
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
-import { Mic, MicOff, Volume2, Loader2 } from "lucide-react"
+import { Mic, MicOff, Volume2, VolumeX, Loader2, RefreshCw } from "lucide-react"
 import Link from "next/link"
 import EnvVarStatus from "../components/EnvVarStatus"
 import ModelSelector from "../components/ModelSelector"
+import LanguageSwitcher from "../components/LanguageSwitcher"
+import { Switch } from "../components/ui/switch"
+import { Label } from "../components/ui/label"
 
 type TranscriptSegment = {
   text: string
@@ -51,6 +54,7 @@ const LANGUAGES = {
     { value: "hi-IN", label: "Hindi" },
   ],
   output: [
+    { value: "hi", label: "Hindi" },
     { value: "en", label: "English" },
     { value: "es", label: "Spanish" },
     { value: "fr", label: "French" },
@@ -65,7 +69,6 @@ const LANGUAGES = {
     { value: "pl", label: "Polish" },
     { value: "tr", label: "Turkish" },
     { value: "ar", label: "Arabic" },
-    { value: "hi", label: "Hindi" },
     { value: "ur", label: "Urdu" },
     { value: "bn", label: "Bengali" },
     { value: "th", label: "Thai" },
@@ -87,19 +90,46 @@ const LANGUAGES = {
   ],
 }
 
+// Helper function to find the best matching input language code for an output language
+function findMatchingInputLanguage(outputLang: string): string {
+  // First try to find an exact match with the language code
+  const exactMatch = LANGUAGES.input.find((lang) => lang.value.startsWith(`${outputLang}-`))
+  if (exactMatch) return exactMatch.value
+
+  // If no exact match, try to find a language with the same base code
+  // For example, if outputLang is "hi", look for "hi-IN"
+  const baseMatch = LANGUAGES.input.find((lang) => lang.value.split("-")[0] === outputLang)
+  if (baseMatch) return baseMatch.value
+
+  // If still no match, return English as default
+  return "en-US"
+}
+
+// Translation cache to improve performance
+const translationCache = new Map<string, { translation: string; speaker: string }>()
+
 export default function HomePage() {
+  // Default models
+  const GROQ_DEFAULT_MODEL = "llama3-70b-8192"
+  const TOGETHER_DEFAULT_MODEL = "meta-llama/Llama-3.1-70B-Instruct-Turbo"
+
   const [inputLanguage, setInputLanguage] = useState("en-US")
-  const [outputLanguage, setOutputLanguage] = useState("es")
+  const [outputLanguage, setOutputLanguage] = useState("hi")
   const [originalTranscript, setOriginalTranscript] = useState<TranscriptSegment[]>([])
   const [translatedTranscript, setTranslatedTranscript] = useState<TranslationSegment[]>([])
   const [infoBanner, setInfoBanner] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [isTranslating, setIsTranslating] = useState(false)
-  const [isMicActive, setIsMicActive] = useState(false)
+  const [isMicActive, setIsMicActive] = useState(false) // Start with mic off
   const [volumeLevel, setVolumeLevel] = useState(0)
-  const { speak, cancel } = useTTS()
-  const [selectedModel, setSelectedModel] = useState("llama3-8b-8192") // Default to a smaller model
+  const { speak, cancel, isSpeaking } = useTTS()
+  const [selectedModel, setSelectedModel] = useState(GROQ_DEFAULT_MODEL) // Default to Groq
   const [isBrowserSupported, setIsBrowserSupported] = useState(true)
+  const [isStoppingRecording, setIsStoppingRecording] = useState(false)
+  const [translationProvider, setTranslationProvider] = useState<"together" | "groq">("groq") // Default to Groq
+  const [isInitialized, setIsInitialized] = useState(false)
+  const [autoSpeak, setAutoSpeak] = useState(true) // Default to auto-speak enabled
+  const [speechError, setSpeechError] = useState<string | null>(null)
 
   // Speech recognition references
   const recognitionRef = useRef<any>(null)
@@ -107,6 +137,13 @@ export default function HomePage() {
   const audioContextRef = useRef<AudioContext | null>(null)
   const analyserRef = useRef<AnalyserNode | null>(null)
   const animationIdRef = useRef<number | null>(null)
+  const isTranslatingRef = useRef(false)
+  const translationQueueRef = useRef<{ text: string; inputLang: string; outputLang: string; model: string }[]>([])
+  const processingTranslationRef = useRef(false)
+  const inactivityTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const restartAttemptRef = useRef(0)
+  const lastTranslationRef = useRef<string>("")
+  const speakTimeoutRef = useRef<NodeJS.Timeout | null>(null)
 
   // Check browser support on mount
   useEffect(() => {
@@ -119,6 +156,142 @@ export default function HomePage() {
     if (!isSpeechRecognitionSupported) {
       setError("Speech recognition is not supported in this browser. Please try Chrome, Edge, or Safari.")
     }
+
+    // Check API keys availability
+    checkAPIAvailability()
+
+    // Clean up on unmount
+    return () => {
+      cleanupResources()
+      cancel() // Ensure speech is cancelled
+
+      // Clear any pending timeouts
+      if (speakTimeoutRef.current) {
+        clearTimeout(speakTimeoutRef.current)
+        speakTimeoutRef.current = null
+      }
+    }
+  }, [])
+
+  // Function to check API availability
+  const checkAPIAvailability = async () => {
+    try {
+      // Check Groq first (preferred)
+      const groqResponse = await fetch("/api/check-groq-key")
+      const groqData = await groqResponse.json()
+
+      if (groqResponse.ok && groqData.valid) {
+        console.log("Groq API is available, using as primary")
+        setTranslationProvider("groq")
+        setSelectedModel(GROQ_DEFAULT_MODEL)
+        setIsInitialized(true)
+        return
+      }
+
+      // If Groq is not available, check Together
+      const togetherResponse = await fetch("/api/check-together-key")
+      const togetherData = await togetherResponse.json()
+
+      if (togetherResponse.ok && togetherData.valid) {
+        console.log("Together AI API is available, using as fallback")
+        setTranslationProvider("together")
+        setSelectedModel(TOGETHER_DEFAULT_MODEL)
+        setIsInitialized(true)
+        return
+      }
+
+      // If neither is available
+      console.log("No translation API is available")
+      setError("No translation API is available. Please check your API keys.")
+      setIsInitialized(true)
+    } catch (error) {
+      console.error("Error checking API availability:", error)
+      setIsInitialized(true)
+    }
+  }
+
+  // Reset inactivity timeout
+  const resetInactivityTimeout = useCallback(() => {
+    // Clear existing timeout
+    if (inactivityTimeoutRef.current) {
+      clearTimeout(inactivityTimeoutRef.current)
+      inactivityTimeoutRef.current = null
+    }
+
+    // Set new timeout - stop recording after 2 minutes of silence
+    inactivityTimeoutRef.current = setTimeout(() => {
+      if (isMicActive) {
+        console.log("No speech detected for 2 minutes, stopping recording")
+        setInfoBanner("No speech detected for a while, stopping microphone")
+        stopRecording()
+
+        // Clear banner after 3 seconds
+        setTimeout(() => {
+          setInfoBanner(null)
+        }, 3000)
+      }
+    }, 120000) // 2 minutes
+  }, [isMicActive])
+
+  // Clean up all resources
+  const cleanupResources = useCallback(() => {
+    console.log("Cleaning up resources...")
+
+    // Clear inactivity timeout
+    if (inactivityTimeoutRef.current) {
+      clearTimeout(inactivityTimeoutRef.current)
+      inactivityTimeoutRef.current = null
+    }
+
+    // Clear speak timeout
+    if (speakTimeoutRef.current) {
+      clearTimeout(speakTimeoutRef.current)
+      speakTimeoutRef.current = null
+    }
+
+    // Stop SpeechRecognition
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop()
+      } catch (e) {
+        console.error("Error stopping recognition:", e)
+      }
+      recognitionRef.current = null
+    }
+
+    // Stop media stream tracks
+    if (mediaStreamRef.current) {
+      try {
+        mediaStreamRef.current.getTracks().forEach((track) => {
+          track.stop()
+        })
+      } catch (e) {
+        console.error("Error stopping media stream:", e)
+      }
+      mediaStreamRef.current = null
+    }
+
+    // Clean up audio context
+    if (audioContextRef.current) {
+      try {
+        audioContextRef.current.close()
+      } catch (e) {
+        console.error("Error closing audio context:", e)
+      }
+      audioContextRef.current = null
+    }
+
+    // Cancel animation frame
+    if (animationIdRef.current) {
+      cancelAnimationFrame(animationIdRef.current)
+      animationIdRef.current = null
+    }
+
+    // Reset state
+    setVolumeLevel(0)
+    setIsMicActive(false)
+    setIsStoppingRecording(false)
+    restartAttemptRef.current = 0
   }, [])
 
   // Start recording with browser's SpeechRecognition
@@ -126,13 +299,27 @@ export default function HomePage() {
     try {
       console.log("Starting recording...")
       setError(null)
+      setSpeechError(null)
+      setIsStoppingRecording(false)
+
+      // Cancel any ongoing speech
+      cancel()
 
       if (!isBrowserSupported) {
         throw new Error("Speech recognition is not supported in this browser")
       }
 
+      // Clean up any existing resources first
+      cleanupResources()
+
       // Request microphone access
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      })
       mediaStreamRef.current = stream
 
       // Set up audio context for volume visualization
@@ -153,7 +340,6 @@ export default function HomePage() {
       animateVolume()
 
       // Create and configure SpeechRecognition
-      // Use a safer approach to access the SpeechRecognition API
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
       if (!SpeechRecognition) {
         throw new Error("SpeechRecognition not available in this browser")
@@ -170,18 +356,20 @@ export default function HomePage() {
       recognition.onstart = () => {
         console.log("SpeechRecognition started")
         setIsMicActive(true)
+        resetInactivityTimeout()
       }
 
       recognition.onresult = (event: any) => {
-        console.log("Speech recognition result received:", event)
+        if (isStoppingRecording) return
+
+        // Reset inactivity timeout on speech
+        resetInactivityTimeout()
 
         for (let i = event.resultIndex; i < event.results.length; i++) {
           const transcript = event.results[i][0].transcript
           const isFinal = event.results[i].isFinal
 
           if (transcript.trim() !== "") {
-            console.log(`Transcript received (${isFinal ? "final" : "interim"}):`, transcript)
-
             // Update original transcript
             setOriginalTranscript((prev) => {
               // If the last segment is not final, replace it
@@ -193,79 +381,181 @@ export default function HomePage() {
             })
 
             if (isFinal) {
-              translateText(transcript, inputLanguage, outputLanguage, selectedModel)
-                .then((result) => {
-                  setTranslatedTranscript((prev) => [...prev, { text: result.translation, speaker: result.speaker }])
-                })
-                .catch((err) => {
-                  console.error("Translation error:", err)
-                  setError("Translation failed. Please try again.")
-                })
+              // Add to translation queue
+              translationQueueRef.current.push({
+                text: transcript,
+                inputLang: inputLanguage,
+                outputLang: outputLanguage,
+                model: selectedModel,
+              })
+
+              // Process queue if not already processing
+              if (!processingTranslationRef.current) {
+                processTranslationQueue()
+              }
             }
           }
         }
       }
 
       recognition.onerror = (event: any) => {
+        if (isStoppingRecording) return
         console.error("SpeechRecognition error:", event.error)
-        setError(`Browser speech recognition error: ${event.error}`)
+
+        // Don't show "aborted" errors when we're intentionally stopping
+        if (event.error !== "aborted" && event.error !== "no-speech") {
+          setError(`Browser speech recognition error: ${event.error}`)
+        }
       }
 
       recognition.onend = () => {
         console.log("SpeechRecognition ended")
-        // Restart if we're still supposed to be recording
-        if (isMicActive) {
-          console.log("Restarting SpeechRecognition...")
-          recognition.start()
+
+        // Restart if we're still supposed to be recording and not intentionally stopping
+        if (isMicActive && !isStoppingRecording) {
+          // Limit restart attempts to prevent infinite loops
+          if (restartAttemptRef.current < 3) {
+            console.log(`Restarting SpeechRecognition (attempt ${restartAttemptRef.current + 1})...`)
+            restartAttemptRef.current++
+
+            try {
+              setTimeout(() => {
+                if (recognitionRef.current) {
+                  recognitionRef.current.start()
+                }
+              }, 300) // Small delay before restart
+            } catch (e) {
+              console.error("Error restarting recognition:", e)
+              setError("Failed to restart speech recognition. Please try again.")
+              setIsMicActive(false)
+              cleanupResources()
+            }
+          } else {
+            console.error("Too many restart attempts, stopping recording")
+            setError("Speech recognition stopped due to too many restart attempts. Please try again.")
+            setIsMicActive(false)
+            cleanupResources()
+          }
+        } else {
+          setIsMicActive(false)
+          setIsStoppingRecording(false)
+          cleanupResources()
         }
       }
 
       // Start recognition
       recognition.start()
+
+      // Start inactivity timeout
+      resetInactivityTimeout()
     } catch (error) {
       console.error("Failed to start recording:", error)
       setError(`Recording failed: ${error instanceof Error ? error.message : String(error)}`)
       setIsMicActive(false)
+      setIsStoppingRecording(false)
+      cleanupResources()
+    }
+  }
+
+  // Process translation queue
+  const processTranslationQueue = async () => {
+    if (translationQueueRef.current.length === 0 || processingTranslationRef.current) {
+      return
+    }
+
+    processingTranslationRef.current = true
+    setIsTranslating(true)
+    isTranslatingRef.current = true
+
+    try {
+      const item = translationQueueRef.current.shift()
+      if (!item) {
+        processingTranslationRef.current = false
+        setIsTranslating(false)
+        isTranslatingRef.current = false
+        return
+      }
+
+      const result = await translateText(item.text, item.inputLang, item.outputLang, item.model)
+
+      // Only update if we're still recording or if this is the last item
+      if (isMicActive || translationQueueRef.current.length === 0) {
+        setTranslatedTranscript((prev) => [...prev, { text: result.translation, speaker: result.speaker }])
+
+        // Store the latest translation
+        lastTranslationRef.current = result.translation
+
+        // Auto-speak the translation if enabled
+        if (autoSpeak) {
+          // Cancel any ongoing speech first
+          cancel()
+
+          // Clear any pending speak timeouts
+          if (speakTimeoutRef.current) {
+            clearTimeout(speakTimeoutRef.current)
+          }
+
+          // Add a small delay before speaking to ensure everything is ready
+          speakTimeoutRef.current = setTimeout(() => {
+            try {
+              speak(result.translation, outputLanguage)
+            } catch (error) {
+              console.error("Error auto-speaking translation:", error)
+              setSpeechError(`Failed to speak: ${error instanceof Error ? error.message : String(error)}`)
+            }
+            speakTimeoutRef.current = null
+          }, 500)
+        }
+      }
+
+      // Process next item if any
+      if (translationQueueRef.current.length > 0) {
+        processTranslationQueue()
+      } else {
+        processingTranslationRef.current = false
+        setIsTranslating(false)
+        isTranslatingRef.current = false
+      }
+    } catch (error) {
+      console.error("Error processing translation queue:", error)
+      processingTranslationRef.current = false
+      setIsTranslating(false)
+      isTranslatingRef.current = false
+
+      // Continue with next item if any
+      if (translationQueueRef.current.length > 0) {
+        setTimeout(processTranslationQueue, 1000) // Retry after a delay
+      }
     }
   }
 
   // Stop recording
-  const stopRecording = () => {
+  const stopRecording = useCallback(() => {
     console.log("Stopping recording...")
-    setIsMicActive(false)
+    setIsStoppingRecording(true)
 
-    // Stop SpeechRecognition
-    if (recognitionRef.current) {
-      recognitionRef.current.stop()
-      recognitionRef.current = null
+    // Cancel any ongoing speech if auto-speak is enabled
+    if (autoSpeak) {
+      cancel()
     }
 
-    // Stop media stream tracks
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach((track) => {
-        track.stop()
-      })
-      mediaStreamRef.current = null
+    // Clear any pending speak timeouts
+    if (speakTimeoutRef.current) {
+      clearTimeout(speakTimeoutRef.current)
+      speakTimeoutRef.current = null
     }
 
-    // Clean up audio context
-    if (audioContextRef.current) {
-      audioContextRef.current.close().catch(console.error)
-      audioContextRef.current = null
+    // Complete any pending translations
+    if (translationQueueRef.current.length > 0) {
+      setInfoBanner("Completing pending translations...")
     }
 
-    // Cancel animation frame
-    if (animationIdRef.current) {
-      cancelAnimationFrame(animationIdRef.current)
-      animationIdRef.current = null
-    }
-
-    setVolumeLevel(0)
-  }
+    cleanupResources()
+  }, [cleanupResources, cancel, autoSpeak])
 
   // Toggle microphone
   const toggleMic = () => {
-    if (isMicActive) {
+    if (isMicActive || isStoppingRecording) {
       stopRecording()
     } else {
       startRecording()
@@ -290,11 +580,58 @@ export default function HomePage() {
     animationIdRef.current = requestAnimationFrame(animateVolume)
   }
 
+  // Create a cache key for translations
+  const createCacheKey = (text: string, inputLang: string, outputLang: string, model: string) => {
+    return `${text}|${inputLang}|${outputLang}|${model}`
+  }
+
   // Translation function
   async function translateText(text: string, inputLang: string, outputLang: string, model: string) {
-    setIsTranslating(true)
+    // Check cache first
+    const cacheKey = createCacheKey(text, inputLang, outputLang, model)
+    if (translationCache.has(cacheKey)) {
+      const cachedResult = translationCache.get(cacheKey)!
+      return {
+        translation: cachedResult.translation,
+        speaker: cachedResult.speaker as "patient" | "provider" | "unknown",
+      }
+    }
+
+    // Don't translate if input and output languages are the same base language
+    if (inputLang.split("-")[0] === outputLang) {
+      return {
+        translation: text,
+        speaker: "unknown",
+      }
+    }
+
     try {
-      const response = await fetch("/api/translate", {
+      // Determine which API to use based on the model and provider preference
+      let apiEndpoint = "/api/translate" // Default to Groq
+      let modelToUse = model
+
+      // If model is a Together model or provider is Together
+      if (model.includes("meta-llama") || model.includes("mistralai") || translationProvider === "together") {
+        apiEndpoint = "/api/translate-together"
+        modelToUse = model.includes("meta-llama") || model.includes("mistralai") ? model : TOGETHER_DEFAULT_MODEL
+      }
+      // If model is a Groq model or provider is Groq
+      else if (
+        model.includes("llama3-") ||
+        model.includes("mixtral-") ||
+        model.includes("gemma-") ||
+        translationProvider === "groq"
+      ) {
+        apiEndpoint = "/api/translate"
+        modelToUse =
+          model.includes("llama3-") || model.includes("mixtral-") || model.includes("gemma-")
+            ? model
+            : GROQ_DEFAULT_MODEL
+      }
+
+      console.log(`Translating with ${apiEndpoint}, model: ${modelToUse}`)
+
+      const response = await fetch(apiEndpoint, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -303,57 +640,256 @@ export default function HomePage() {
           text,
           inputLanguage: inputLang,
           outputLanguage: outputLang,
-          model,
+          model: modelToUse,
         }),
       })
 
+      // Check for 503 error specifically for Groq
+      if (!response.ok && apiEndpoint === "/api/translate" && response.status === 503) {
+        console.log("Groq service unavailable (503), switching to Together AI")
+
+        // Switch to Together AI for this translation
+        const togetherResponse = await fetch("/api/translate-together", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            text,
+            inputLanguage: inputLang,
+            outputLanguage: outputLang,
+            model: TOGETHER_DEFAULT_MODEL,
+          }),
+        })
+
+        if (togetherResponse.ok) {
+          const data = await togetherResponse.json()
+          const result = {
+            translation: data.translation || data.translatedText || text,
+            speaker: data.speaker || ("unknown" as "patient" | "provider" | "unknown"),
+          }
+
+          // Cache the result
+          translationCache.set(cacheKey, {
+            translation: result.translation,
+            speaker: result.speaker,
+          })
+
+          return result
+        }
+      }
+
+      // If primary service fails (not 503 for Groq), try the other one
       if (!response.ok) {
-        throw new Error(`Translation request failed: ${response.status} ${response.statusText}`)
+        console.log(`${apiEndpoint} failed, trying alternative service`)
+
+        // Try the alternative service
+        const alternativeEndpoint = apiEndpoint === "/api/translate" ? "/api/translate-together" : "/api/translate"
+
+        const alternativeModel = apiEndpoint === "/api/translate" ? TOGETHER_DEFAULT_MODEL : GROQ_DEFAULT_MODEL
+
+        const alternativeResponse = await fetch(alternativeEndpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            text,
+            inputLanguage: inputLang,
+            outputLanguage: outputLang,
+            model: alternativeModel,
+          }),
+        })
+
+        if (alternativeResponse.ok) {
+          const data = await alternativeResponse.json()
+          const result = {
+            translation: data.translation || data.translatedText || text,
+            speaker: data.speaker || ("unknown" as "patient" | "provider" | "unknown"),
+          }
+
+          // Cache the result
+          translationCache.set(cacheKey, {
+            translation: result.translation,
+            speaker: result.speaker,
+          })
+
+          return result
+        }
+
+        // If both services fail, use a simple fallback
+        return {
+          translation: `[Translation failed] ${text}`,
+          speaker: "unknown",
+        }
       }
 
       const data = await response.json()
-
-      if (data.error) {
-        throw new Error(data.error)
+      const result = {
+        translation: data.translation || data.translatedText || text,
+        speaker: data.speaker || ("unknown" as "patient" | "provider" | "unknown"),
       }
 
-      setIsTranslating(false)
-      return {
-        speaker: data.speaker || "unknown",
-        translation: data.translation || data.translatedText || "",
-      }
+      // Cache the result
+      translationCache.set(cacheKey, {
+        translation: result.translation,
+        speaker: result.speaker,
+      })
+
+      return result
     } catch (error) {
       console.error("Translation error:", error)
-      setIsTranslating(false)
-      throw error
+      return {
+        translation: `[Error] ${error instanceof Error ? error.message : "Translation failed"}`,
+        speaker: "unknown",
+      }
     }
   }
 
-  // Clean up on unmount or language change
-  useEffect(() => {
-    return () => {
-      stopRecording()
+  // Switch input and output languages
+  const switchLanguages = () => {
+    // Cancel any ongoing speech
+    cancel()
+
+    // Clear any pending speak timeouts
+    if (speakTimeoutRef.current) {
+      clearTimeout(speakTimeoutRef.current)
+      speakTimeoutRef.current = null
     }
-  }, [])
+
+    // Get the current languages
+    const currentInputLang = inputLanguage
+    const currentOutputLang = outputLanguage
+
+    // Find the best matching input language for the current output language
+    const newInputLang = findMatchingInputLanguage(currentOutputLang)
+
+    // Get the base language from the current input language
+    const newOutputLang = currentInputLang.split("-")[0]
+
+    console.log(`Switching languages: ${currentInputLang} -> ${newInputLang}, ${currentOutputLang} -> ${newOutputLang}`)
+
+    // Set the new languages
+    setInputLanguage(newInputLang)
+    setOutputLanguage(newOutputLang)
+
+    // Show info banner
+    setInfoBanner("Languages switched")
+    setTimeout(() => setInfoBanner(null), 3000)
+
+    // Reset transcripts
+    setOriginalTranscript([])
+    setTranslatedTranscript([])
+
+    // Clear translation cache
+    translationCache.clear()
+
+    // Restart recording if active
+    if (isMicActive) {
+      stopRecording()
+      setTimeout(() => startRecording(), 500)
+    }
+  }
 
   // Reset when language changes
   useEffect(() => {
+    // Cancel any ongoing speech
+    cancel()
+
+    // Clear any pending speak timeouts
+    if (speakTimeoutRef.current) {
+      clearTimeout(speakTimeoutRef.current)
+      speakTimeoutRef.current = null
+    }
+
     setOriginalTranscript([])
     setTranslatedTranscript([])
     setInfoBanner("Language changed, resetting...")
     const t = setTimeout(() => setInfoBanner(null), 3000)
 
+    // Clear translation cache
+    translationCache.clear()
+
+    // Clear translation queue
+    translationQueueRef.current = []
+
     if (isMicActive) {
       stopRecording()
-      startRecording()
+      setTimeout(() => startRecording(), 500)
     }
 
-    cancel()
     return () => clearTimeout(t)
-  }, [inputLanguage, outputLanguage, selectedModel])
+  }, [inputLanguage, outputLanguage, selectedModel, stopRecording, cancel])
 
-  function handleSpeak(text: string) {
-    speak(text, outputLanguage)
+  // Handle speaking the latest translation
+  const handleSpeak = useCallback(
+    (text: string) => {
+      // Reset speech error
+      setSpeechError(null)
+
+      // Clear any pending speak timeouts
+      if (speakTimeoutRef.current) {
+        clearTimeout(speakTimeoutRef.current)
+        speakTimeoutRef.current = null
+      }
+
+      if (isSpeaking) {
+        cancel()
+      } else {
+        try {
+          speak(text, outputLanguage)
+        } catch (error) {
+          console.error("Error speaking translation:", error)
+          setSpeechError(`Failed to speak: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+    },
+    [speak, cancel, isSpeaking, outputLanguage],
+  )
+
+  // Reset everything
+  const handleReset = () => {
+    // Cancel any ongoing speech
+    cancel()
+
+    // Clear any pending speak timeouts
+    if (speakTimeoutRef.current) {
+      clearTimeout(speakTimeoutRef.current)
+      speakTimeoutRef.current = null
+    }
+
+    stopRecording()
+    setOriginalTranscript([])
+    setTranslatedTranscript([])
+    translationCache.clear()
+    translationQueueRef.current = []
+    setInfoBanner("Reset complete")
+    setSpeechError(null)
+    setTimeout(() => setInfoBanner(null), 3000)
+  }
+
+  // Toggle auto-speak
+  const toggleAutoSpeak = () => {
+    setAutoSpeak(!autoSpeak)
+    setInfoBanner(`Auto-speak ${!autoSpeak ? "enabled" : "disabled"}`)
+    setTimeout(() => setInfoBanner(null), 3000)
+
+    // If turning off auto-speak while speaking, cancel current speech
+    if (autoSpeak && isSpeaking) {
+      cancel()
+    }
+  }
+
+  // Show loading state until initialized
+  if (!isInitialized) {
+    return (
+      <div className="flex items-center justify-center min-h-screen">
+        <div className="text-center">
+          <Loader2 className="mx-auto h-8 w-8 animate-spin text-primary" />
+          <p className="mt-2">Initializing Healthcare Translator...</p>
+        </div>
+      </div>
+    )
   }
 
   return (
@@ -379,6 +915,10 @@ export default function HomePage() {
                 </SelectContent>
               </Select>
             </div>
+
+            {/* Language Switcher */}
+            <LanguageSwitcher onSwitch={switchLanguages} />
+
             <div className="flex-1">
               <label className="block text-sm font-medium mb-1">Output Language</label>
               <Select value={outputLanguage} onValueChange={setOutputLanguage}>
@@ -398,26 +938,57 @@ export default function HomePage() {
 
           {/* Add Model Selector */}
           <div className="mb-4">
-            <ModelSelector value={selectedModel} onChange={setSelectedModel} />
+            <ModelSelector value={selectedModel} onChange={setSelectedModel} preferredProvider={translationProvider} />
+          </div>
+
+          {/* Auto-speak toggle */}
+          <div className="flex items-center space-x-2 mb-4 justify-center">
+            <Switch id="auto-speak" checked={autoSpeak} onCheckedChange={toggleAutoSpeak} />
+            <Label htmlFor="auto-speak">Auto-speak translations</Label>
+          </div>
+
+          {/* Translation Service Indicator */}
+          <div className="mb-4 text-center">
+            <span className="text-sm font-medium">
+              Translation Service:{" "}
+              {translationProvider === "groq" ? (
+                <span className="text-green-600">Groq (Primary)</span>
+              ) : (
+                <span className="text-amber-600">Together AI (Fallback)</span>
+              )}
+            </span>
           </div>
 
           {/* Microphone button - always visible */}
-          <div className="flex justify-center mb-4">
+          <div className="flex justify-center gap-4 mb-4">
             <Button
               onClick={toggleMic}
               variant={isMicActive ? "destructive" : "default"}
               className="flex items-center gap-2 px-6 py-3 text-lg"
-              disabled={!isBrowserSupported}
+              disabled={!isBrowserSupported || isStoppingRecording}
             >
               {isMicActive ? (
                 <>
                   <MicOff size={20} /> Stop Microphone
+                </>
+              ) : isStoppingRecording ? (
+                <>
+                  <Loader2 className="animate-spin" size={20} /> Stopping...
                 </>
               ) : (
                 <>
                   <Mic size={20} /> Start Microphone
                 </>
               )}
+            </Button>
+
+            <Button
+              onClick={handleReset}
+              variant="outline"
+              className="flex items-center gap-2"
+              title="Reset everything"
+            >
+              <RefreshCw size={18} />
             </Button>
           </div>
 
@@ -429,6 +1000,7 @@ export default function HomePage() {
 
           <Banner message={error} type="error" />
           <Banner message={infoBanner} type="info" />
+          {speechError && <Banner message={`Speech error: ${speechError}`} type="error" />}
 
           {/* Environment Variable Status */}
           <EnvVarStatus />
@@ -470,7 +1042,15 @@ export default function HomePage() {
                 variant="outline"
                 className="flex items-center gap-2"
               >
-                <Volume2 size={18} /> Speak Latest Translation
+                {isSpeaking ? (
+                  <>
+                    <VolumeX size={18} /> Stop Speaking
+                  </>
+                ) : (
+                  <>
+                    <Volume2 size={18} /> Speak Latest Translation
+                  </>
+                )}
               </Button>
             </div>
           )}

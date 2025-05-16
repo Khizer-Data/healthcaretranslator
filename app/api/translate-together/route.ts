@@ -4,7 +4,7 @@ export const runtime = "nodejs"
 
 export async function POST(req: NextRequest) {
   try {
-    const { text, inputLanguage, outputLanguage, model = "llama3-70b-8192" } = await req.json()
+    const { text, inputLanguage, outputLanguage, model = "meta-llama/Llama-3.1-70B-Instruct-Turbo" } = await req.json()
 
     if (!text) {
       return NextResponse.json({ error: "Text is required" }, { status: 400 })
@@ -18,11 +18,11 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Output language is required" }, { status: 400 })
     }
 
-    const GROQ_API_KEY = process.env.GROQ_API_KEY
+    const TOGETHER_API_KEY = process.env.TOGETHER_API_KEY
 
-    if (!GROQ_API_KEY) {
-      console.error("GROQ_API_KEY is not set")
-      return NextResponse.json({ error: "GROQ API key is not configured" }, { status: 503 })
+    if (!TOGETHER_API_KEY) {
+      console.error("TOGETHER_API_KEY is not set")
+      return NextResponse.json({ error: "Together API key is not configured" }, { status: 503 })
     }
 
     // Determine the base language from the input language code (e.g., "en-US" -> "en")
@@ -35,12 +35,12 @@ Maintain medical accuracy and terminology. Only respond with the translation, no
     // Create the prompt for the user
     const userPrompt = `Translate this text from ${baseInputLang} to ${outputLanguage}: "${text}"`
 
-    // Make the API request to Groq
-    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    // Make the API request to Together AI
+    const response = await fetch("https://api.together.xyz/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${GROQ_API_KEY}`,
+        Authorization: `Bearer ${TOGETHER_API_KEY}`,
       },
       body: JSON.stringify({
         model: model,
@@ -61,16 +61,19 @@ Maintain medical accuracy and terminology. Only respond with the translation, no
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}))
-      console.error("Groq API error:", errorData)
+      console.error("Together AI API error:", errorData)
 
       // Return 503 for service unavailable to trigger fallback
-      return NextResponse.json({ error: `Groq API error: ${response.status} ${response.statusText}` }, { status: 503 })
+      return NextResponse.json(
+        { error: `Together AI API error: ${response.status} ${response.statusText}` },
+        { status: 503 },
+      )
     }
 
     const data = await response.json()
 
     if (!data.choices || !data.choices[0] || !data.choices[0].message) {
-      console.error("Unexpected Groq API response format:", data)
+      console.error("Unexpected Together AI API response format:", data)
       return NextResponse.json({ error: "Unexpected API response format" }, { status: 500 })
     }
 
