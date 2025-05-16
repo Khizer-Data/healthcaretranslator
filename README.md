@@ -243,7 +243,7 @@ You can deploy this project using any platform that supports **Node.js** and **N
 
 
 The project is currently deployed at:
-**[https://vercel.com/ibrahimzafar679-5396s-projects/v0-healthcaretranslator11-fu](https://vercel.com/ibrahimzafar679-5396s-projects/v0-healthcaretranslator11-fu)**
+**https://v0-healthcaretranslator11-fu.vercel.app/**
 
 ---
 
