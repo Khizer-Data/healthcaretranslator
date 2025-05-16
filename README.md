@@ -299,15 +299,18 @@ This project is licensed under the MIT License.
 
 ---
 
-## How It Works
+Here’s an updated version of your README with the **Groq API server error (503)** clarification added under the **AI Tools and Integrations** section and a quick note in **Project Requirements Fulfilled** to reflect this behavior.
 
-1. Create and modify your project using [v0.dev](https://v0.dev)
-2. Deploy your chats from the v0 interface
-3. Changes are automatically pushed to this repository
-4. Vercel deploys the latest version from this repository
+---
+
+### ✅ Updated Sections:
+
+---
+
+### Project Requirements Fulfilled
 
 
-## Build your app
+⚠️ *Note*: If Groq API is temporarily unavailable due to server load (HTTP 503), translation will fail silently or display a fallback. The interface shows a ✅ green tick once the service is back online.
 
-Continue building your app on:
-**[https://v0.dev/chat/projects/62iMv3QpChk](https://v0.dev/chat/projects/62iMv3QpChk)**
+
+
